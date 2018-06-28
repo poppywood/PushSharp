@@ -5,6 +5,7 @@ using System.Net.Security;
 using System.Threading.Tasks;
 using System.Security.Cryptography.X509Certificates;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Net;
 using PushSharp.Core;
@@ -84,7 +85,8 @@ namespace PushSharp.Apple
             lock (notificationBatchQueueLock) {
 
                 notifications.Enqueue (notification);
-
+                var currentIsSendBatchRunning = Interlocked.CompareExchange(ref isSendBatchRunning, 0, 0);
+                if (currentIsSendBatchRunning == 1) return;
                 if (notifications.Count >= Configuration.InternalBatchSize) {
 
                     // Make the timer fire immediately and send a batch off
@@ -103,80 +105,109 @@ namespace PushSharp.Apple
         }
 
         long batchId = 0;
-
-        async Task SendBatch ()
+        int isSendBatchRunning;
+        async Task SendBatch()
         {
-            batchId++;
-            if (batchId >= long.MaxValue)
-                batchId = 1;
-            
-            // Pause the timer
-            timerBatchWait.Change (Timeout.Infinite, Timeout.Infinite);
-
-            if (notifications.Count <= 0)
+            var currentIsSendBatchRunning = Interlocked.CompareExchange(ref isSendBatchRunning, 1, 0);
+            if (currentIsSendBatchRunning == 1)
                 return;
 
-            // Let's store the batch items to send internally
-            var toSend = new List<CompletableApnsNotification> ();
+            try
+            {
+                batchId++;
+                if (batchId >= long.MaxValue)
+                    batchId = 1;
 
-            while (notifications.Count > 0 && toSend.Count < Configuration.InternalBatchSize) {
-                var n = notifications.Dequeue ();
-                toSend.Add (n);
-            }
+                // Pause the timer
+                timerBatchWait.Change(Timeout.Infinite, Timeout.Infinite);
 
+                if (notifications.Count <= 0)
+                    return;
 
-            Log.Info ("APNS-Client[{0}]: Sending Batch ID={1}, Count={2}", id, batchId, toSend.Count);
+                // Let's store the batch items to send internally
+                var toSend = new List<CompletableApnsNotification>();
 
-            try {
-
-                var data = createBatch (toSend);
-
-                if (data != null && data.Length > 0) {
-
-                    for (var i = 0; i <= Configuration.InternalBatchFailureRetryCount; i++) {
-
-                        await connectingSemaphore.WaitAsync ();
-
-                        try {
-                            // See if we need to connect
-                            if (!socketCanWrite () || i > 0)
-                                await connect ();
-                        } finally {
-                            connectingSemaphore.Release ();
-                        }
-                
-                        try {
-                            await networkStream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
-                            break;
-                        } catch (Exception ex) when (i != Configuration.InternalBatchFailureRetryCount) {
-                            Log.Info("APNS-CLIENT[{0}]: Retrying Batch: Batch ID={1}, Error={2}", id, batchId, ex);
-                        }
+                lock (notificationBatchQueueLock)
+                {
+                    while (notifications.Count > 0 && toSend.Count < Configuration.InternalBatchSize)
+                    {
+                        var n = notifications.Dequeue();
+                        toSend.Add(n);
                     }
-
-                    foreach (var n in toSend)
-                        sent.Add (new SentNotification (n));
                 }
 
-            } catch (Exception ex) {
-                Log.Error ("APNS-CLIENT[{0}]: Send Batch Error: Batch ID={1}, Error={2}", id, batchId, ex);
-                foreach (var n in toSend)
-                    n.CompleteFailed (new ApnsNotificationException (ApnsNotificationErrorStatusCode.ConnectionError, n.Notification, ex));
+
+                Log.Info("APNS-Client[{0}]: Sending Batch ID={1}, Count={2}", id, batchId, toSend.Count);
+
+                try
+                {
+
+                    var data = createBatch(toSend);
+
+                    if (data != null && data.Length > 0)
+                    {
+
+                        for (var i = 0; i <= Configuration.InternalBatchFailureRetryCount; i++)
+                        {
+
+                            await connectingSemaphore.WaitAsync();
+
+                            try
+                            {
+                                // See if we need to connect
+                                if (!socketCanWrite() || i > 0)
+                                    await connect();
+                            }
+                            finally
+                            {
+                                connectingSemaphore.Release();
+                            }
+
+                            try
+                            {
+                                await networkStream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
+                                break;
+                            }
+                            catch (Exception ex) when (i != Configuration.InternalBatchFailureRetryCount)
+                            {
+                                Log.Info("APNS-CLIENT[{0}]: Retrying Batch: Batch ID={1}, Error={2}", id, batchId, ex);
+                            }
+                        }
+
+                        foreach (var n in toSend)
+                            sent.Add(new SentNotification(n));
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("APNS-CLIENT[{0}]: Send Batch Error: Batch ID={1}, Error={2}", id, batchId, ex);
+                    foreach (var n in toSend)
+                        n.CompleteFailed(new ApnsNotificationException(ApnsNotificationErrorStatusCode.ConnectionError,
+                            n.Notification, ex));
+                }
+
+                Log.Info("APNS-Client[{0}]: Sent Batch, waiting for possible response...", id);
+
+                try
+                {
+                    await Reader();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("APNS-Client[{0}]: Reader Exception: {1}", id, ex);
+                }
+
+                Log.Info("APNS-Client[{0}]: Done Reading for Batch ID={1}, reseting batch timer...", id, batchId);
             }
-
-            Log.Info ("APNS-Client[{0}]: Sent Batch, waiting for possible response...", id);
-
-            try {
-                await Reader ();
-            } catch (Exception ex) {
-                Log.Error ("APNS-Client[{0}]: Reader Exception: {1}", id, ex);
+            finally
+            {
+                Interlocked.Exchange(ref isSendBatchRunning, 0);
             }
-
-            Log.Info ("APNS-Client[{0}]: Done Reading for Batch ID={1}, reseting batch timer...", id, batchId);
 
             // Restart the timer for the next batch
-            timerBatchWait.Change (Configuration.InternalBatchingWaitPeriod, Timeout.InfiniteTimeSpan);
+            timerBatchWait.Change(Configuration.InternalBatchingWaitPeriod, Timeout.InfiniteTimeSpan);
         }
-
         byte[] createBatch (List<CompletableApnsNotification> toSend)
         {
             if (toSend == null || toSend.Count <= 0)
@@ -354,7 +385,8 @@ namespace PushSharp.Apple
                     (sender, targetHost, localCerts, remoteCert, acceptableIssuers) => certificate);
 
                 try {
-                    stream.AuthenticateAsClient (Configuration.Host, certificates, System.Security.Authentication.SslProtocols.Tls, false);
+                    var tls = System.Security.Authentication.SslProtocols.Tls | System.Security.Authentication.SslProtocols.Tls11 | System.Security.Authentication.SslProtocols.Tls12;
+                    stream.AuthenticateAsClient(Configuration.Host, certificates, tls, false);
                 } catch (System.Security.Authentication.AuthenticationException ex) {
                     throw new ApnsConnectionException ("SSL Stream Failed to Authenticate as Client", ex);
                 }
