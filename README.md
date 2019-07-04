@@ -1,3 +1,10 @@
+PushSharp v4.0 + Firebase Cloud Messaging Support
+=================================================
+
+Based on PushSharp 4.0. I have added support for FCM 
+
+
+
 PushSharp v4.0
 ==============
 
